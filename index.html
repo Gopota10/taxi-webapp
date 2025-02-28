@@ -1,104 +1,212 @@
-<!DOCTYPE html>
-<html lang="ru">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Taxi CRM</title>
-    <!-- Подключение Telegram Web App SDK -->
-    <script src="https://telegram.org/js/telegram-web-app.js"></script>
-    <style>
-        /* Базовые стили для удобства использования */
-        body { font-family: Arial, sans-serif; margin: 20px; }
-        .section { margin-bottom: 20px; }
-        button { padding: 10px; margin: 5px; }
-    </style>
-</head>
-<body>
-    <!-- Отображение информации о пользователе -->
-    <div id="user-info"></div>
-    
-    <!-- Секция для пассажиров -->
-    <div class="section" id="passenger-section">
-        <h2>Пассажир</h2>
-        <input id="name" placeholder="Имя" type="text">
-        <input id="phone" placeholder="Телефон" type="text">
-        <button onclick="register()">Зарегистрироваться</button>
-        <input id="from-to" placeholder="Откуда - Куда" type="text">
-        <input id="booking-time" placeholder="Дата и время брони (ГГГГ-ММ-ДД ЧЧ:ММ)" type="text">
-        <input id="comment" placeholder="Комментарий (опционально)" type="text">
-        <button onclick="createOrder(false)">Создать заказ</button>
-        <button onclick="createOrder(true)">Забронировать</button>
-    </div>
-    
-    <!-- Секция для админов, скрыта по умолчанию -->
-    <div class="section" id="admin-section" style="display: none;">
-        <h2>Админ</h2>
-        <button onclick="viewOrders()">Посмотреть заказы</button>
-    </div>
-    
-    <!-- Контейнер для вывода ответов -->
-    <div id="response"></div>
+// Токены ботов
+const PASSENGER_BOT_TOKEN = "7658839972:AAGh_BDFGbZrVggEu8_GN_3WiG6t9t_sI_M";
+const DRIVER_BOT_TOKEN = "7663866007:AAF5Tg5OF-cVXse0raK06hqyYMAjY1Y14LY";
+const TELEGRAM_API = "https://api.telegram.org/bot";
 
-    <script>
-        // Инициализация Telegram Web App
-        const tg = window.Telegram.WebApp;
-        tg.ready();
-        const chatId = tg.initDataUnsafe.user.id; // Получение Chat ID пользователя
-        const serverUrl = "https://script.google.com/macros/s/AKfyc.../exec"; // URL вашего Google Apps Script Web App
+// Получение таблиц
+const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+const passengersSheet = spreadsheet.getSheetByName("Пассажиры");
+const driversSheet = spreadsheet.getSheetByName("Водители");
+const ordersSheet = spreadsheet.getSheetByName("Заказы Такси обычные");
+const bookingsSheet = spreadsheet.getSheetByName("Заказы Бронь");
+const sessionsSheet = spreadsheet.getSheetByName("Сессии");
+const messagesSheet = spreadsheet.getSheetByName("Архив сообщений");
 
-        // Проверка типа пользователя при загрузке
-        fetch(serverUrl, {
-            method: "POST",
-            body: JSON.stringify({ action: "get_user_type", chat_id: chatId })
-        })
-        .then(res => res.json())
-        .then(data => {
-            document.getElementById("user-info").innerText = `Chat ID: ${chatId}`;
-            if (data.type === "Админ") {
-                document.getElementById("admin-section").style.display = "block"; // Показать админ-панель
-            }
+// Вспомогательные функции
+function getCurrentTime() {
+  return Utilities.formatDate(new Date(), "GMT+3", "yyyy-MM-dd HH:mm:ss");
+}
+
+function generateOrderId() {
+  return "ORD-" + Math.floor(Date.now() / 1000);
+}
+
+function sendTelegramMessage(token, chatId, text, replyMarkup) {
+  const url = `${TELEGRAM_API}${token}/sendMessage`;
+  const payload = {
+    chat_id: chatId,
+    text: text,
+    reply_markup: replyMarkup ? JSON.stringify(replyMarkup) : ""
+  };
+  UrlFetchApp.fetch(url, {
+    method: "POST",
+    contentType: "application/json",
+    payload: JSON.stringify(payload)
+  });
+}
+
+function logMessage(sender, receiver, text, orderId) {
+  messagesSheet.appendRow([getCurrentTime(), sender, receiver, text, orderId || ""]);
+}
+
+// Основной обработчик Web App и Webhook
+function doPost(e) {
+  const data = JSON.parse(e.postData.contents);
+  const action = data.action;
+
+  if (action === "register_passenger") {
+    const chatId = data.chat_id;
+    const name = data.name;
+    const phone = data.phone;
+    const existing = passengersSheet.getDataRange().getValues().slice(1).find(row => row[0] == chatId);
+    if (!existing) {
+      passengersSheet.appendRow([chatId, "Пассажир", name, phone, "Активен"]);
+      sendTelegramMessage(PASSENGER_BOT_TOKEN, chatId, `Вы зарегистрированы, ${name}!`);
+      logMessage("Система", chatId, `Регистрация: ${name}, ${phone}`);
+    }
+    return ContentService.createTextOutput(JSON.stringify({ status: "success" }));
+  }
+
+  if (action === "create_order") {
+    const chatId = data.chat_id;
+    const fromTo = data.from_to;
+    const isBooking = data.is_booking || false;
+    const bookingTime = data.booking_time || "";
+    const comment = data.comment || "";
+
+    const orderId = generateOrderId();
+    const passengerData = passengersSheet.getDataRange().getValues().slice(1).find(row => row[0] == chatId);
+    if (!passengerData) return ContentService.createTextOutput(JSON.stringify({ status: "error", message: "Пассажир не найден" }));
+
+    if (isBooking) {
+      const bookingDate = new Date(bookingTime);
+      const now = new Date();
+      if (bookingDate < new Date(now.getTime() + 2 * 60 * 60 * 1000)) {
+        return ContentService.createTextOutput(JSON.stringify({ status: "error", message: "Бронь минимум за 2 часа" }));
+      }
+      const notifyTime = Utilities.formatDate(new Date(bookingDate.getTime() - 15 * 60 * 1000), "GMT+3", "yyyy-MM-dd HH:mm");
+      bookingsSheet.appendRow([orderId, "Новый", passengerData[2], "", fromTo, comment, bookingTime, notifyTime]);
+    } else {
+      ordersSheet.appendRow([orderId, "Новый", passengerData[2], "", fromTo, getCurrentTime()]);
+    }
+
+    sessionsSheet.appendRow([chatId, "Создание заказа", JSON.stringify(data), "", getCurrentTime(), ""]);
+    logMessage(chatId, "Система", `Создан заказ ${orderId}: ${fromTo}`, orderId);
+
+    const drivers = driversSheet.getDataRange().getValues().slice(1);
+    drivers.forEach(driver => {
+      if (driver[5] === "Активен") {
+        const replyMarkup = {
+          inline_keyboard: [[{ text: "Взять заказ", callback_data: `accept_${orderId}` }]]
+        };
+        sendTelegramMessage(DRIVER_BOT_TOKEN, driver[0], `Новый заказ ${orderId}: ${fromTo}`, replyMarkup);
+      }
+    });
+
+    sendTelegramMessage(PASSENGER_BOT_TOKEN, chatId, `Заказ ${orderId} создан!`);
+    return ContentService.createTextOutput(JSON.stringify({ status: "success", order_id: orderId }));
+  }
+
+  if (action === "accept_order") {
+    const orderId = data.order_id;
+    const driverChatId = data.driver_chat_id;
+
+    const driverData = driversSheet.getDataRange().getValues().slice(1).find(row => row[0] == driverChatId);
+    if (!driverData) return ContentService.createTextOutput(JSON.stringify({ status: "error", message: "Водитель не найден" }));
+
+    let sheetToUpdate = ordersSheet;
+    let orderRow = sheetToUpdate.getDataRange().getValues().slice(1).findIndex(row => row[0] == orderId) + 2;
+    if (!orderRow || orderRow == 1) {
+      sheetToUpdate = bookingsSheet;
+      orderRow = sheetToUpdate.getDataRange().getValues().slice(1).findIndex(row => row[0] == orderId) + 2;
+    }
+
+    if (orderRow > 1 && sheetToUpdate.getRange(orderRow, 2).getValue() === "Новый") {
+      sheetToUpdate.getRange(orderRow, 4).setValue(driverData[2]); // Водитель
+      sheetToUpdate.getRange(orderRow, 2).setValue("В работе");    // Статус
+      const passengerName = sheetToUpdate.getRange(orderRow, 3).getValue();
+      const passengerChatId = passengersSheet.getDataRange().getValues().slice(1).find(row => row[2] == passengerName)[0];
+      sendTelegramMessage(PASSENGER_BOT_TOKEN, passengerChatId, `Ваш заказ ${orderId} взял водитель ${driverData[2]}`);
+      sendTelegramMessage(DRIVER_BOT_TOKEN, driverChatId, `Вы взяли заказ ${orderId}`);
+      logMessage(driverChatId, passengerChatId, `Заказ ${orderId} в работе`);
+      sessionsSheet.appendRow([driverChatId, "Принятие заказа", orderId, getCurrentTime(), "", ""]);
+      return ContentService.createTextOutput(JSON.stringify({ status: "success" }));
+    }
+    return ContentService.createTextOutput(JSON.stringify({ status: "error", message: "Заказ уже взят или не найден" }));
+  }
+
+  if (action === "update_order_status") {
+    const orderId = data.order_id;
+    const driverChatId = data.driver_chat_id;
+    const newStatus = data.status;
+
+    const driverData = driversSheet.getDataRange().getValues().slice(1).find(row => row[0] == driverChatId);
+    if (!driverData) return ContentService.createTextOutput(JSON.stringify({ status: "error", message: "Водитель не найден" }));
+
+    let sheetToUpdate = ordersSheet;
+    let orderRow = sheetToUpdate.getDataRange().getValues().slice(1).findIndex(row => row[0] == orderId) + 2;
+    if (!orderRow || orderRow == 1) {
+      sheetToUpdate = bookingsSheet;
+      orderRow = sheetToUpdate.getDataRange().getValues().slice(1).findIndex(row => row[0] == orderId) + 2;
+    }
+
+    if (orderRow > 1 && sheetToUpdate.getRange(orderRow, 4).getValue() === driverData[2]) {
+      sheetToUpdate.getRange(orderRow, 2).setValue(newStatus);
+      const passengerName = sheetToUpdate.getRange(orderRow, 3).getValue();
+      const passengerChatId = passengersSheet.getDataRange().getValues().slice(1).find(row => row[2] == passengerName)[0];
+      sendTelegramMessage(PASSENGER_BOT_TOKEN, passengerChatId, `Статус заказа ${orderId} обновлён: ${newStatus}`);
+      sendTelegramMessage(DRIVER_BOT_TOKEN, driverChatId, `Статус заказа ${orderId} обновлён: ${newStatus}`);
+      logMessage(driverChatId, passengerChatId, `Статус заказа ${orderId}: ${newStatus}`);
+      return ContentService.createTextOutput(JSON.stringify({ status: "success" }));
+    }
+    return ContentService.createTextOutput(JSON.stringify({ status: "error", message: "Заказ не найден или не ваш" }));
+  }
+
+  if (action === "get_user_type") {
+    const chatId = data.chat_id;
+    let userType = "Неизвестно";
+    [passengersSheet, driversSheet].forEach(sheet => {
+      const user = sheet.getDataRange().getValues().slice(1).find(row => row[0] == chatId);
+      if (user) userType = user[1];
+    });
+    return ContentService.createTextOutput(JSON.stringify({ type: userType }));
+  }
+
+  if (action === "get_orders") {
+    const chatId = data.chat_id;
+    const driverData = driversSheet.getDataRange().getValues().slice(1).find(row => row[0] == chatId);
+    if (driverData && driverData[1] === "Админ") {
+      const orders = [];
+      [ordersSheet, bookingsSheet].forEach(sheet => {
+        sheet.getDataRange().getValues().slice(1).forEach(row => {
+          orders.push({ id: row[0], status: row[1], from_to: row[4] });
         });
+      });
+      return ContentService.createTextOutput(JSON.stringify({ orders: orders }));
+    }
+    return ContentService.createTextOutput(JSON.stringify({ status: "error", message: "Доступ запрещён" }));
+  }
 
-        // Функция регистрации пассажира
-        function register() {
-            const name = document.getElementById("name").value;
-            const phone = document.getElementById("phone").value;
-            fetch(serverUrl, {
-                method: "POST",
-                body: JSON.stringify({ action: "register_passenger", chat_id: chatId, name, phone })
-            })
-            .then(res => res.json())
-            .then(data => {
-                document.getElementById("response").innerText = data.status === "success" ? "Регистрация прошла успешно!" : "Ошибка!";
-            });
-        }
+  // Обработка callback-запросов от Telegram (для водителей)
+  if (data.callback_query) {
+    const callbackData = data.callback_query.data;
+    const driverChatId = data.callback_query.from.id;
+    if (callbackData.startsWith("accept_")) {
+      const orderId = callbackData.split("_")[1];
+      const response = doPost({ postData: { contents: JSON.stringify({ action: "accept_order", order_id: orderId, driver_chat_id: driverChatId }) } });
+      return response;
+    }
+  }
+}
 
-        // Функция создания заказа (обычного или брони)
-        function createOrder(isBooking) {
-            const fromTo = document.getElementById("from-to").value;
-            const bookingTime = isBooking ? document.getElementById("booking-time").value : "";
-            const comment = document.getElementById("comment").value;
-            fetch(serverUrl, {
-                method: "POST",
-                body: JSON.stringify({ action: "create_order", chat_id: chatId, from_to: fromTo, is_booking: isBooking, booking_time: bookingTime, comment })
-            })
-            .then(res => res.json())
-            .then(data => {
-                document.getElementById("response").innerText = data.status === "success" ? `Заказ ${data.order_id} создан!` : data.message;
-            });
-        }
+// Уведомления для бронирований
+function checkBookingNotifications() {
+  const now = new Date();
+  const bookings = bookingsSheet.getDataRange().getValues().slice(1);
+  bookings.forEach((row, index) => {
+    const notifyTime = new Date(row[7]);
+    if (now >= notifyTime && row[1] === "В работе" && row[7]) {
+      const driverChatId = driversSheet.getDataRange().getValues().slice(1).find(d => d[2] == row[3])[0];
+      sendTelegramMessage(DRIVER_BOT_TOKEN, driverChatId, `Напоминание: заказ ${row[0]} через 15 минут (${row[4]})`);
+      bookingsSheet.getRange(index + 2, 8).setValue("");
+    }
+  });
+}
 
-        // Функция просмотра заказов (для админов)
-        function viewOrders() {
-            fetch(serverUrl, {
-                method: "POST",
-                body: JSON.stringify({ action: "get_orders", chat_id: chatId })
-            })
-            .then(res => res.json())
-            .then(data => {
-                document.getElementById("response").innerHTML = data.orders ? data.orders.map(o => `<p>${o.id}: ${o.status} - ${o.from_to}</p>`).join("") : data.message;
-            });
-        }
-    </script>
-</body>
-</html>
+// Установка триггера для уведомлений
+function setTriggers() {
+  ScriptApp.newTrigger("checkBookingNotifications")
+    .timeBased()
+    .everyMinutes(1)
+    .create();
+}
